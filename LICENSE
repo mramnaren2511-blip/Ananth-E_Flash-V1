@@ -1,0 +1,76 @@
+==============================================================================
+ANANTH E-TECH FAIR-USE LICENSE
+Version 1.0
+==============================================================================
+
+Copyright (c) 2026 Mane Ram Naren (Ananth E Tech). All rights reserved.
+Patent Pending: 202641127187
+
+This software, the Ananth E-Flash Memory Allocator ("Software"), is owned by 
+Ananth E Tech. By accessing, downloading, compiling, or using the Software, 
+you ("Licensee") agree to the following terms and conditions.
+
+------------------------------------------------------------------------------
+1. GRANT OF LICENSE (FREE FOR INDIVIDUALS & STARTUPS)
+------------------------------------------------------------------------------
+Subject to the conditions and limitations set forth below, Ananth E Tech 
+grants a non-exclusive, non-transferable, perpetual, worldwide license to 
+use, modify, and distribute the Software free of charge to entities that meet 
+BOTH of the following criteria:
+  a. The entity (including its parent companies, subsidiaries, and affiliates) 
+     has less than $2,000,000 USD in annual gross revenue.
+  b. The entity (including its parent companies, subsidiaries, and affiliates) 
+     has raised less than $2,000,000 USD in total cumulative funding.
+
+Eligible entities are permitted to use this Software for both non-commercial 
+research and commercial product development.
+
+------------------------------------------------------------------------------
+2. ENTERPRISE RESTRICTION (THE COMMERCIAL BOUNDARY)
+------------------------------------------------------------------------------
+If the Licensee exceeds EITHER the $2,000,000 USD annual gross revenue limit 
+OR the $2,000,000 USD total funding limit, the Licensee is STRICTLY PROHIBITED 
+from using this Software in any production, staging, testing, or internal 
+commercial environment. 
+
+Large entities, including but not limited to High-Frequency Trading (HFT) firms, 
+Cloud Service Providers, Datacenters, and Enterprise Corporations, must obtain 
+a separate Commercial License from Ananth E Tech prior to any integration or 
+deployment. 
+
+To inquire about a Commercial License, contact: ananthetech@gmail.com
+
+------------------------------------------------------------------------------
+3. INTELLECTUAL PROPERTY & ATTRIBUTION
+------------------------------------------------------------------------------
+a. The core architecture of the Software (including the L0 CTZLL Bitmap Slabs, 
+   L1 Array Stack routing, and 64-Bit Packed God Register metadata) remains the 
+   exclusive intellectual property of Ananth E Tech and is protected under pending 
+   patents.
+b. If this Software is distributed or embedded in another open-source or free 
+   project, this LICENSE file must be included unaltered in the root directory 
+   of the distribution.
+
+------------------------------------------------------------------------------
+4. DEVELOPER'S NOTE & COMMUNITY CONTRIBUTIONS
+------------------------------------------------------------------------------
+I built the Ananth E-Flash Engine with a relentless focus on extreme low-latency 
+and lock-free performance. However, I do not claim this code to be 100% perfect. 
+Real-world edge cases, extreme multi-threading race conditions, or architecture-
+specific bugs may exist.
+
+I invite the global C++ community, senior engineers, and systems researchers to 
+freely tear this code apart, stress-test it, and point out my mistakes. Pull 
+requests, bug reports, and architectural critiques are highly encouraged. By 
+working together, we can build the ultimate memory allocator.
+
+------------------------------------------------------------------------------
+5. NO WARRANTY & LIMITATION OF LIABILITY
+------------------------------------------------------------------------------
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE 
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER 
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, 
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE 
+SOFTWARE.
