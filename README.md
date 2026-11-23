@@ -1,141 +1,63 @@
-# ⚡ Ananth E-Flash V1.0
-**Ultra-Low-Latency, Lock-Free, OS-Agnostic C++ Memory Allocator**
+# Ananth E-Flash V2.0
 
-[![License: Ananth Fair-Use](https://img.shields.io/badge/License-Ananth_Fair--Use_(%3C$2M_Free)-blue.svg)](#license--commercial-terms)
-[![Architecture: x86_64 | ARM64](https://img.shields.io/badge/Arch-x86__64_%7C_ARM64-success.svg)](#core-architecture)
-[![Language: C++17/20](https://img.shields.io/badge/C%2B%2B-17%2F20-orange.svg)](#quick-start--integration)
-[![Patent Pending](https://img.shields.io/badge/Patent_Pending-202641127187-critical.svg)](#license--commercial-terms)
-
-**Ananth E-Flash V1.0** is a bare-metal, lock-free memory allocator engineered in C++ to eliminate allocation bottlenecks in ultra-low-latency environments such as High-Frequency Trading (HFT) systems, real-time game engines, and hyperscale cloud infrastructure.
+**Ultra-Low-Latency, Lock-Free Hybrid C++17 Memory Allocator (`LD_PRELOAD` Drop-In)**  
+**Author:** Mane Ram Naren ([Ananth E Tech](https://github.com/mramnaren2511-blip/Ananth-E_Flash-V1))  
+**Patent Pending:** Application No. `202641127187`  
+**License:** Ananth E-Tech Fair-Use License (Free for individuals & startups under $2M revenue/funding; commercial license for enterprises)
 
 ---
 
-## 🤝 A Humble Note from the Creator
+## Hybrid 4-Tier Architecture
 
-Hello! I built **Ananth E-Flash** with a relentless obsession for bare-metal speed, lock-free concurrency, and zero-overhead memory management. 
+Ananth E-Flash V2.0 eliminates lock contention and kernel `mmap_lock` / TLB shootdown storms across small, medium, and large allocations:
 
-However, **I do not claim this code to be 100% perfect.** Memory management at the OS and kernel boundary is unforgiving. While this engine has passed aggressive local stress tests, there may still be hidden edge cases, extreme multi-threading race conditions, ABA corner cases, or architecture-specific bugs that I have not caught yet.
+| Tier | Allocation Range | Mechanism | Key Advantage |
+| :--- | :--- | :--- | :--- |
+| **Tier 1 (Fast Slabs)** | `16 B – 32 KB` (bins `0..11`) | L0 64-bit `__builtin_ctzll` bitmap slab + L1 TLS array stack | O(1) allocation, zero pointer chasing, compile-time stride arithmetic |
+| **Tier 2 (Medium Spans)** | `64 KB – 256 KB` (bins `12..14`) | Sub-sliced inside 2 MB HugePage `CentralSpan`s | Eliminates `mmap`/`munmap` churn on network & engine buffers |
+| **Tier 3 (Large Cache)** | `512 KB – 4 MB` | Lock-free bounded extent cache (`8` slots per power-of-two bucket) | Reuses large buffers without page faults or TLB shootdowns |
+| **Tier 4 (Direct OS)** | `> 4 MB` (tag `63`) | Direct `mmap` + `MADV_HUGEPAGE` / `munmap` | Zero memory hoarding for multi-megabyte allocations |
 
-I am opening up this source code because I believe true foundational technology is forged through peer review. **I humbly invite the global C++ community, senior systems engineers, HFT developers, and OS researchers to freely tear this code apart:**
-* Stress-test it under your most brutal workloads.
-* Point out my architectural mistakes or memory-ordering flaws.
-* Submit Pull Requests, bug reports, and critiques to help rectify any issues.
-
-You have a completely free hand to audit, critique, and improve this engine. Let's build the ultimate memory allocator together.
-
----
-
-## 🧠 Core Architecture
-
-Ananth E-Flash replaces traditional pointer-chasing freelists and heavy mutex locks with a hybrid hardware-accelerated hierarchy:
-
-### 1. L0 64-Bit CTZLL Bitmap Slabs (Zero Pointer Chasing)
-* Small allocations (`16B` to `32KB` across 12 size classes) are served directly from thread-local **64-block L0 Bitmap Slabs**.
-* Allocation resolves in $O(1)$ time using a single hardware instruction (`__builtin_ctzll` / `tzcnt`) to locate the first available block without touching user payload memory.
-* Deallocation on the local L0 slab uses compile-time constant stride multiplication instead of hardware division (`divq`), clearing the bit in a single CPU cycle.
-
-### 2. L1 Fast Array Stack
-* When an L0 slab is full or a freed pointer belongs to an older slab, blocks fall back to a thread-local **L1 Array Stack** (`FLASH_TCACHE_MAX = 256`).
-* Unlike traditional intrusive linked lists that dereference freed memory (causing L1/L2 cache misses), the L1 Array Stack stores raw addresses contiguously in thread-local storage (TLS).
-
-### 3. God Register V1.0 (64-Bit Packed Atomic Metadata)
-Every block header packs its complete lifecycle state into a single 64-bit atomic word (`god_reg_t`), eliminating multi-field synchronization overhead:
-
-| Bits | Field | Description |
-| :--- | :--- | :--- |
-| `0..37` (38 bits) | **Offset / Pages** | Exact byte offset within the 2MB Span (or page count for large allocations) |
-| `38..49` (12 bits) | **Worker ID** | Owning thread/worker engine index (supports up to 1,024 concurrent workers) |
-| `50..55` (6 bits) | **NUMA Node** | Hardware NUMA topology identifier |
-| `56..61` (6 bits) | **Size Class** | Bin index (`0..11` for fast bins, `63` for direct OS huge allocations) |
-| `62` (1 bit) | **Allocated Bit** | Atomic ownership flag (`1` = Allocated, `0` = Free) for double-free protection |
-| `63` (1 bit) | **Magic Bit** | Hardware validation tag to distinguish E-Flash blocks from foreign pointers |
-
-### 4. Lock-Free 2MB Hugepage Spans & XOR-Canary Remote Mailboxes
-* Backing memory is mapped in **2MB Hugepage Spans** (`MADV_HUGEPAGE`) to minimize TLB misses.
-* Central span freelists use **21-bit byte offsets paired with a 42-bit monotonic ABA tag** for lock-free CAS harvesting.
-* Cross-thread `free()` calls are batched locally and flushed via lock-free atomic CAS to the owning worker's `remote_free_head`, protected against heap corruption via process-unique **XOR Canary Seeds**.
-
-### 5. Zero-Recursion `LD_PRELOAD` Hijack Engine (`malloc_hijack.cpp`)
-* **8MB Static Bootstrap Arena:** Safely intercepts early dynamic linker (`ld.so`), `dlsym`, and `pthread` TLS allocations before the main engine initializes, preventing infinite recursion.
-* **Self-Healing Page-Boundary Registry:** Tracks explicit page-aligned allocations in a 256K-slot lock-free hash table so foreign OS pointers passed to `free()` or `realloc()` are safely ignored without segfaulting.
+### V2.0 Production Hardening Highlights
+- **Race-Free Lock-Free Page Registry:** Removed unsafe concurrent tombstone-to-zero resets in `unregister_page_aligned_ptr`, preserving linear-probing chains under multi-threaded load.
+- **Safe Foreign Pointer Bridging (`RTLD_NEXT`):** Delegates pre-`LD_PRELOAD` foreign `free`, `realloc`, and `malloc_usable_size` calls cleanly to the underlying libc allocator rather than truncating at 4 KB page boundaries.
+- **ARM64 & Weak-Memory Safety:** Upgraded `eflash_min`/`eflash_max` bounds and `BlockHeader::god_tag` handoffs to release/acquire ordering.
+- **Cross-Span Aliasing & Overflow Guards:** Bounded L0 slab returns by exact carved `slab_count[bin]`, tracked `os_page_alloc` early-bootstrap fallbacks, guarded huge alignments against unsigned underflow, and ensured `calloc` zeroes Tier 3 cached extents.
+- **Bounded Remote-Free Batching:** Flushes remote mailboxes at `64` blocks (and immediately for `>= 16 KB` bins) to prevent Producer-Consumer RSS bloat.
 
 ---
 
-## 📊 Performance Benchmarks
-
-In local stress testing on 64-bit Linux (`-O3 -march=native`), Ananth E-Flash demonstrated extreme throughput and stability:
-
-* **5,000,000 Allocations & Deallocations:** Completed in **`0.333 seconds`** (~15M+ ops/sec single-thread baseline).
-* **Multi-Threaded Contention:** Zero deadlocks, zero memory leaks, and deterministic latency scaling across worker threads.
-
-*(Note: You can reproduce these benchmarks on your own hardware using your internal staging suite or standard allocator benchmarks like `mimalloc-bench`.)*
-
----
-
-## 🚀 Quick Start & Integration
-
-Ananth E-Flash has **zero external dependencies** (only standard `pthread` on Linux) and can be integrated in three ways:
-
-### Option 1: Header-Only Core API (`flash.h`)
-Include `flash.h` directly in your C++ project for raw access to the core engine:
-
-```cpp
-#include "flash.h"
-
-int main() {
-    void* ptr = eflash_malloc_core(128);
-    // Use memory...
-    eflash_free_core(ptr);
-    return 0;
-}
-```
-
-### Option 2: Direct Source Compilation (Drop-In Global Override)
-Compile `malloc_hijack.cpp` alongside your application to automatically route all `malloc`, `free`, `calloc`, `realloc`, `new`, `delete`, `std::vector`, and `posix_memalign` calls through Ananth E-Flash:
+## Quick Start (Build, Test & Benchmark)
 
 ```bash
-g++ -O3 -march=native your_app.cpp malloc_hijack.cpp -lpthread -o your_app
-./your_app
+# 1. Build libananth_eflash.so (-O3 -std=c++17)
+make
+
+# 2. Run correctness, edge-case, multi-threaded stress tests + real binary LD_PRELOAD checks
+make test
+
+# 3. Run reproducible side-by-side benchmark vs system glibc malloc
+make bench
 ```
 
-### Option 3: `LD_PRELOAD` Shared Library (Zero Recompilation)
-Build the shared object `.so` file to accelerate existing binaries (C++ engines, Python, Redis, Node.js, etc.) without touching their source code:
-
+Use as a drop-in allocator for any Linux x86_64 or ARM64 binary:
 ```bash
-# 1. Compile the shared library
-g++ -O3 -march=native -shared -fPIC malloc_hijack.cpp -o libeflash.so -lpthread
-
-# 2. Run any target binary with LD_PRELOAD
-LD_PRELOAD=./libeflash.so ./your_high_frequency_app
+LD_PRELOAD=./libananth_eflash.so ./your_application
 ```
 
 ---
 
-## 🛠️ Contributing & Bug Reports
+## Verified Benchmark Results (Linux x86_64, GCC `-O3`, `LD_PRELOAD`)
 
-Found a bug, a race condition, a memory leak, or a way to shave off another CPU cycle? 
-1. Fork the repository.
-2. Create a branch (`git checkout -b fix/race-condition-in-span`).
-3. Commit your changes with a clear explanation of the flaw you found and how you fixed it.
-4. Open a **Pull Request** or create a detailed **GitHub Issue**.
+Measured via `make bench` (`benchmarks/bench_suite.cpp`, throughput in million alloc+free pairs per second):
 
-Every critique and contribution is deeply appreciated!
+| Workload | System `glibc` | Ananth E-Flash V2.0 | Speedup |
+| :--- | :---: | :---: | :---: |
+| **Tier 2 — 64 KB (Single-Thread)** | 0.84 M/s | **34.84 M/s** | **41.5x** |
+| **Tier 2 — 256 KB (Single-Thread)** | 0.52 M/s | **10.64 M/s** | **20.5x** |
+| **Tier 3 — 1 MB (Single-Thread)** | 0.38 M/s | **2.42 M/s** | **6.4x** |
+| **Tier 2 — 64 KB (4 Threads)** | 1.52 M/s | **7.94 M/s** | **5.2x** |
+| **Tier 1 — 64 B (4 Threads)** | 68.72 M/s | **82.70 M/s** | **1.20x** |
+| **Tier 1 — 64 B (Single-Thread)** | 85.76 M/s | 47.94 M/s | 0.56x* |
 
----
-
-## 📜 License & Commercial Terms
-
-Ananth E-Flash is distributed under the **Ananth E-Tech Fair-Use License v1.0** (Patent Pending: `202641127187`).
-
-### ✅ Free for Individuals, Researchers & Startups
-You are granted a **free, perpetual license** to use, modify, and distribute this software (for both non-commercial and commercial products) if your organization meets **BOTH** of the following criteria:
-1. **Less than $2,000,000 USD** in annual gross revenue.
-2. **Less than $2,000,000 USD** in total cumulative raised funding.
-
-### 🏢 Enterprise & Commercial Licensing
-If your organization exceeds either the **$2,000,000 USD** revenue or funding threshold—including **High-Frequency Trading (HFT) firms, Quantitative Hedge Funds, Cloud Hyperscalers, Datacenters, and Large Enterprises**—you are **strictly prohibited** from using this software in any production, staging, testing, or internal environment without an active Commercial License.
-
-* **Author:** Mane Ram Naren (Founder, Ananth E Tech)
-* **Commercial Licensing & Enterprise Inquiries:** [ananthetech@gmail.com](mailto:ananthetech@gmail.com)
-
-See the [LICENSE](./LICENSE) file for the complete legal terms and conditions.
+*\*Note on Single-Thread 64B: Under `LD_PRELOAD`, E-Flash V2.0 executes full MMU bounds verification and atomic `fetch_and` double-free protection on every call, whereas single-threaded glibc tcache skips atomic operations. Under multi-threaded load (4T) and medium/large buffers (64 KB – 1 MB), E-Flash V2.0 significantly outperforms glibc.*

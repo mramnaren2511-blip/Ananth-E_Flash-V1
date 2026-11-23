@@ -1,18 +1,12 @@
 // ============================================================================
-// ANANTH E-FLASH V2.0 — ULTRA-LOW-LATENCY LOCK-FREE C++ MEMORY ALLOCATOR
-// Architecture: L0 64-Bit CTZLL Bitmap Slabs + L1 Array Stack + God Register
+// ANANTH E-FLASH V2.0 - ULTRA-LOW-LATENCY LOCK-FREE C++ MEMORY ALLOCATOR
+// Architecture:
+//   Tier 1 (16B - 32KB, bins 0..11): L0 64-Bit CTZLL Bitmap Slabs + L1 Stack
+//   Tier 2 (64KB - 256KB, bins 12..14): Medium 2MB Hugepage Sub-Spans
+//   Tier 3 (512KB - 4MB): Lock-Free Bounded Large Extent Cache (Zero munmap)
+//   Tier 4 (> 4MB): Direct OS Hugepage mmap/munmap
 // Author: Mane Ram Naren (Ananth E Tech)
-// 
-// DEVELOPER'S NOTE:
-// Hello! I built this core engine with a relentless focus on bare-metal speed 
-// and lock-free performance. However, I know this code is not 100% perfect. 
-// There might be edge cases, multi-threading race conditions, or architecture-
-// specific bugs that I haven't caught yet.
-// 
-// I humbly invite the C++ community, senior engineers, and systems researchers 
-// to freely tear this code apart, stress-test it, and point out my mistakes. 
-// Your pull requests, critiques, and bug reports are highly welcome! 
-// Let's build the ultimate memory allocator together.
+// Patent Pending: 202641127187
 //
 // LICENSE: ANANTH E-TECH FAIR-USE LICENSE
 // - FREE for individuals & startups (under $2M revenue / $2M funding).
@@ -30,6 +24,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sched.h>
@@ -48,18 +43,23 @@
 #define FLASH_CACHE_LINE    64
 
 // ==========================================
-// 1. CONSTANTS & SIZE CLASSES (16B to 32KB)
+// 1. CONSTANTS & SIZE CLASSES (16B to 256KB + Cached Large up to 4MB)
 // ==========================================
-constexpr size_t  FLASH_PAGE_SIZE      = 4096;
-constexpr size_t  FLASH_SPAN_SIZE      = 2097152; // 2MB Hugepage Spans
-constexpr size_t  FLASH_MAX_FAST_ALLOC = 32768;  
-constexpr uint8_t FLASH_NUM_BINS       = 12;     
-constexpr uint8_t FLASH_LARGE_BIN_TAG  = 63;     
-constexpr size_t  FLASH_TCACHE_MAX     = 256;    
-constexpr size_t  FLASH_TCACHE_BATCH   = 64;     
-constexpr size_t  FLASH_TRANSFER_SLOTS = 128;    
-constexpr size_t  FLASH_PARTIAL_SLOTS  = 64;     
-constexpr size_t  FLASH_MAX_WORKERS    = 1024;   
+constexpr size_t   FLASH_PAGE_SIZE         = 4096;
+constexpr size_t   FLASH_SPAN_SIZE         = 2097152; // 2MB Hugepage Spans
+constexpr size_t   FLASH_MAX_FAST_ALLOC    = 262144;  // 256KB (Tier 1 + Tier 2)
+constexpr uint8_t  FLASH_NUM_BINS          = 15;      // 16B .. 256KB
+constexpr uint8_t  FLASH_LARGE_BIN_TAG     = 63;      // Tier 3 (Cached) & Tier 4 (Direct OS)
+constexpr size_t   FLASH_LARGE_CACHE_MIN   = 524288;  // 512KB
+constexpr size_t   FLASH_LARGE_CACHE_MAX   = 4194304; // 4MB
+constexpr size_t   FLASH_LARGE_CACHE_BINS  = 4;       // 512KB, 1MB, 2MB, 4MB
+constexpr size_t   FLASH_LARGE_CACHE_SLOTS = 8;       // Up to 8 cached extents per large bucket
+constexpr size_t   FLASH_TCACHE_MAX        = 256;
+constexpr size_t   FLASH_TCACHE_BATCH      = 64;
+constexpr size_t   FLASH_REMOTE_BATCH_MAX  = 64;      // Bounded remote batch to avoid Producer-Consumer RSS bloat
+constexpr size_t   FLASH_TRANSFER_SLOTS    = 128;
+constexpr size_t   FLASH_PARTIAL_SLOTS     = 64;
+constexpr size_t   FLASH_MAX_WORKERS       = 1024;
 
 FLASH_ALWAYS_INLINE uint8_t get_size_class(size_t size) noexcept {
     if (size <= 16) return 0;
@@ -68,6 +68,22 @@ FLASH_ALWAYS_INLINE uint8_t get_size_class(size_t size) noexcept {
 
 FLASH_ALWAYS_INLINE size_t class_to_size(uint8_t bin_idx) noexcept {
     return 1ULL << (bin_idx + 4);
+}
+
+FLASH_ALWAYS_INLINE int get_large_cache_bin(size_t bytes) noexcept {
+    if (bytes == 524288ULL)  return 0;
+    if (bytes == 1048576ULL) return 1;
+    if (bytes == 2097152ULL) return 2;
+    if (bytes == 4194304ULL) return 3;
+    return -1;
+}
+
+FLASH_ALWAYS_INLINE size_t round_up_large_cache_size(size_t bytes) noexcept {
+    if (bytes <= 524288ULL)  return 524288ULL;
+    if (bytes <= 1048576ULL) return 1048576ULL;
+    if (bytes <= 2097152ULL) return 2097152ULL;
+    if (bytes <= 4194304ULL) return 4194304ULL;
+    return bytes;
 }
 
 FLASH_ALWAYS_INLINE void cpu_relax() noexcept {
@@ -93,7 +109,7 @@ constexpr size_t WORKER_SHIFT     = OFFSET_BITS;
 constexpr size_t NUMA_SHIFT       = WORKER_SHIFT + WORKER_BITS;
 constexpr size_t SIZE_CLASS_SHIFT = NUMA_SHIFT + NUMA_BITS;
 constexpr size_t ALLOCATED_SHIFT  = SIZE_CLASS_SHIFT + SIZE_CLASS_BITS;
-constexpr size_t MAGIC_SHIFT      = ALLOCATED_SHIFT + 1;                
+constexpr size_t MAGIC_SHIFT      = ALLOCATED_SHIFT + 1;
 
 constexpr god_reg_t OFFSET_MASK     = (1ULL << OFFSET_BITS) - 1;
 constexpr god_reg_t WORKER_MASK     = (1ULL << WORKER_BITS) - 1;
@@ -103,7 +119,7 @@ constexpr god_reg_t ALLOCATED_BIT   = (1ULL << ALLOCATED_SHIFT);
 constexpr god_reg_t MAGIC_BIT       = (1ULL << MAGIC_SHIFT);
 
 FLASH_ALWAYS_INLINE god_reg_t encode_god_register(
-    uint64_t offset_or_pages, uint16_t worker, uint8_t numa, uint8_t size_class, bool is_allocated) noexcept {
+        uint64_t offset_or_pages, uint16_t worker, uint8_t numa, uint8_t size_class, bool is_allocated) noexcept {
     return (offset_or_pages & OFFSET_MASK) |
            ((static_cast<god_reg_t>(worker) & WORKER_MASK) << WORKER_SHIFT) |
            ((static_cast<god_reg_t>(numa) & NUMA_MASK) << NUMA_SHIFT) |
@@ -117,26 +133,32 @@ FLASH_ALWAYS_INLINE god_reg_t set_worker_and_alloc(god_reg_t reg, uint16_t worke
            (is_allocated ? ALLOCATED_BIT : 0ULL) | MAGIC_BIT;
 }
 
-FLASH_ALWAYS_INLINE uint64_t get_offset(god_reg_t reg) noexcept         { return reg & OFFSET_MASK; }
-FLASH_ALWAYS_INLINE uint16_t get_worker(god_reg_t reg) noexcept         { return static_cast<uint16_t>((reg >> WORKER_SHIFT) & WORKER_MASK); }
-FLASH_ALWAYS_INLINE uint8_t  get_numa_node(god_reg_t reg) noexcept      { return static_cast<uint8_t>((reg >> NUMA_SHIFT) & NUMA_MASK); }
-FLASH_ALWAYS_INLINE uint8_t  get_size_class_reg(god_reg_t reg) noexcept { return static_cast<uint8_t>((reg >> SIZE_CLASS_SHIFT) & SIZE_CLASS_MASK); }
-FLASH_ALWAYS_INLINE bool     is_valid_allocated(god_reg_t reg) noexcept { return (reg & (MAGIC_BIT | ALLOCATED_BIT)) == (MAGIC_BIT | ALLOCATED_BIT); }
+FLASH_ALWAYS_INLINE uint64_t get_offset(god_reg_t reg) noexcept          { return reg & OFFSET_MASK; }
+FLASH_ALWAYS_INLINE uint16_t get_worker(god_reg_t reg) noexcept          { return static_cast<uint16_t>((reg >> WORKER_SHIFT) & WORKER_MASK); }
+FLASH_ALWAYS_INLINE uint8_t  get_numa_node(god_reg_t reg) noexcept       { return static_cast<uint8_t>((reg >> NUMA_SHIFT) & NUMA_MASK); }
+FLASH_ALWAYS_INLINE uint8_t  get_size_class_reg(god_reg_t reg) noexcept  { return static_cast<uint8_t>((reg >> SIZE_CLASS_SHIFT) & SIZE_CLASS_MASK); }
+FLASH_ALWAYS_INLINE bool     is_valid_allocated(god_reg_t reg) noexcept  { return (reg & (MAGIC_BIT | ALLOCATED_BIT)) == (MAGIC_BIT | ALLOCATED_BIT); }
 
 // ==========================================
 // 3. OS MEMORY BRIDGE
 // ==========================================
 FLASH_ALWAYS_INLINE void* os_page_alloc(size_t bytes) noexcept {
+    if (bytes == 0 || bytes > (std::numeric_limits<size_t>::max() - FLASH_PAGE_SIZE)) return nullptr;
     size_t align_bytes = (bytes + FLASH_PAGE_SIZE - 1) & ~(FLASH_PAGE_SIZE - 1);
     void* ptr = mmap(nullptr, align_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #ifdef MADV_HUGEPAGE
-    if (ptr != MAP_FAILED && align_bytes >= (2 * 1024 * 1024)) { madvise(ptr, align_bytes, MADV_HUGEPAGE); }
+    if (ptr != MAP_FAILED && align_bytes >= (2 * 1024 * 1024)) {
+        madvise(ptr, align_bytes, MADV_HUGEPAGE);
+    }
 #endif
     return (ptr == MAP_FAILED) ? nullptr : ptr;
 }
 
 FLASH_ALWAYS_INLINE void os_page_free(void* ptr, size_t bytes) noexcept {
-    if (ptr && bytes > 0) munmap(ptr, (bytes + FLASH_PAGE_SIZE - 1) & ~(FLASH_PAGE_SIZE - 1));
+    if (ptr && bytes > 0) {
+        size_t align_bytes = (bytes + FLASH_PAGE_SIZE - 1) & ~(FLASH_PAGE_SIZE - 1);
+        munmap(ptr, align_bytes);
+    }
 }
 
 // ==========================================
@@ -148,6 +170,7 @@ struct alignas(16) BlockHeader {
     std::atomic<god_reg_t> god_tag;
     CentralSpan*           parent_span;
 };
+static_assert(sizeof(BlockHeader) == 16, "BlockHeader must remain 16 bytes for MMU page-boundary safety.");
 
 constexpr uint64_t SPAN_OFFSET_BITS = 21;
 constexpr uint64_t SPAN_OFFSET_MASK = (1ULL << SPAN_OFFSET_BITS) - 1;
@@ -169,7 +192,7 @@ struct alignas(FLASH_CACHE_LINE) CentralSpan {
 };
 
 // ==========================================
-// 5. THE BEAST: L0 BITMAP & L1 ARRAY ENGINE
+// 5. THE BEAST: L0 BITMAP, L1 ARRAY & TIER 3 LARGE CACHE ENGINE
 // ==========================================
 struct alignas(FLASH_CACHE_LINE) LockFreeTransferCache {
     std::atomic<uintptr_t> slots[FLASH_TRANSFER_SLOTS];
@@ -179,23 +202,28 @@ struct alignas(FLASH_CACHE_LINE) LockFreePartialCache {
     std::atomic<CentralSpan*> slots[FLASH_PARTIAL_SLOTS];
 };
 
+struct alignas(FLASH_CACHE_LINE) LockFreeLargeCache {
+    std::atomic<void*> slots[FLASH_LARGE_CACHE_SLOTS];
+};
+
 struct alignas(FLASH_CACHE_LINE) WorkerEngine {
-    uint16_t                       worker_id;
-    uint8_t                        numa_node;
-    uint8_t                        pad0;
-    std::atomic<uint32_t>          active_users; // Ref-counted for safe >1024 threads sharing
-    std::atomic<CentralSpan*>      cached_empty_span[FLASH_NUM_BINS];
-    LockFreePartialCache           partial_spans[FLASH_NUM_BINS];
-    LockFreeTransferCache          transfer_cache[FLASH_NUM_BINS];
+    uint16_t                  worker_id;
+    uint8_t                   numa_node;
+    uint8_t                   pad0;
+    std::atomic<uint32_t>     active_users; // Ref-counted for safe >1024 threads sharing
+    std::atomic<CentralSpan*> cached_empty_span[FLASH_NUM_BINS];
+    LockFreePartialCache      partial_spans[FLASH_NUM_BINS];
+    LockFreeTransferCache     transfer_cache[FLASH_NUM_BINS];
     alignas(FLASH_CACHE_LINE) std::atomic<uintptr_t> remote_free_head;
 };
 
 struct alignas(FLASH_CACHE_LINE) ZoneMaster {
-    uint16_t          total_workers;
-    uint16_t          hardware_cores;
-    god_reg_t         canary_seed;
-    pthread_key_t     tls_cleanup_key;
+    uint16_t                  total_workers;
+    uint16_t                  hardware_cores;
+    god_reg_t                 canary_seed;
+    pthread_key_t             tls_cleanup_key;
     alignas(FLASH_CACHE_LINE) std::atomic<uint16_t> worker_ticket;
+    alignas(FLASH_CACHE_LINE) LockFreeLargeCache    large_cache[FLASH_LARGE_CACHE_BINS];
     alignas(FLASH_CACHE_LINE) WorkerEngine          workers[FLASH_MAX_WORKERS];
 };
 
@@ -212,6 +240,7 @@ struct alignas(FLASH_CACHE_LINE) FastCache {
     // L0 Cache: 64-Bit CTZLL Bitmap Slabs (ZERO Pointer Chasing)
     uint64_t      slab_bitmap[FLASH_NUM_BINS];
     uintptr_t     slab_base[FLASH_NUM_BINS];
+    uint8_t       slab_count[FLASH_NUM_BINS]; // Exact carved count (<= 64) to prevent cross-span L0 aliasing
 
     // L1 Cache: Fast Array Stack (ZERO Payload Touching)
     uint16_t      count[FLASH_NUM_BINS];
@@ -300,6 +329,7 @@ inline void eflash_pthread_Exit_Callback(void*) noexcept {
             }
         }
     }
+
     t_cache.worker = nullptr;
 }
 
@@ -310,6 +340,10 @@ inline void init_eflash_boot_sequence() noexcept {
     uint8_t expected = 0;
     if (EFlash_State.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
         G_Zone = static_cast<ZoneMaster*>(os_page_alloc(sizeof(ZoneMaster)));
+        if (!G_Zone) {
+            EFlash_State.store(0, std::memory_order_release);
+            return;
+        }
         long cpus = sysconf(_SC_NPROCESSORS_ONLN);
         G_Zone->hardware_cores = (cpus > 0) ? static_cast<uint16_t>(cpus) : 4;
         G_Zone->total_workers  = static_cast<uint16_t>(FLASH_MAX_WORKERS);
@@ -317,6 +351,12 @@ inline void init_eflash_boot_sequence() noexcept {
 
         uintptr_t entropy = reinterpret_cast<uintptr_t>(G_Zone) ^ static_cast<uintptr_t>(getpid());
         G_Zone->canary_seed = static_cast<god_reg_t>((entropy << 13) ^ (entropy >> 7) ^ 0xA5A5F0F09696ULL) | 1ULL;
+
+        for (size_t lb = 0; lb < FLASH_LARGE_CACHE_BINS; ++lb) {
+            for (size_t s = 0; s < FLASH_LARGE_CACHE_SLOTS; ++s) {
+                G_Zone->large_cache[lb].slots[s].store(nullptr, std::memory_order_relaxed);
+            }
+        }
 
         pthread_key_create(&G_Zone->tls_cleanup_key, eflash_pthread_Exit_Callback);
         for (size_t i = 0; i < FLASH_MAX_WORKERS; ++i) {
@@ -347,6 +387,7 @@ inline void init_eflash_boot_sequence() noexcept {
 // ==========================================
 FLASH_ALWAYS_INLINE void init_thread_worker() noexcept {
     if (__builtin_expect(EFlash_State.load(std::memory_order_acquire) != 2, 0)) init_eflash_boot_sequence();
+    if (__builtin_expect(!G_Zone, 0)) return;
 
     int cpu = sched_getcpu();
     uint16_t start_slot = (cpu >= 0)
@@ -367,17 +408,16 @@ FLASH_ALWAYS_INLINE void init_thread_worker() noexcept {
     }
 
     if (__builtin_expect(!claimed_exclusive, 0)) {
-        // Fallback when >1024 concurrent threads exist: safely ref-count the shared slot
         G_Zone->workers[chosen_slot].active_users.fetch_add(1U, std::memory_order_acq_rel);
     }
 
     t_cache.worker_id = chosen_slot;
     t_cache.worker    = &G_Zone->workers[chosen_slot];
-    
-    // STRICT BITMAP INITIALIZATION TO PREVENT SEGFAULTS
+
     for (int i = 0; i < FLASH_NUM_BINS; ++i) {
-        t_cache.slab_bitmap[i] = ~0ULL; // Mark all 1s (allocated/invalid)
+        t_cache.slab_bitmap[i] = ~0ULL;
         t_cache.slab_base[i]   = 0;
+        t_cache.slab_count[i]  = 0;
         t_cache.count[i]       = 0;
         t_cache.active_span[i] = nullptr;
     }
@@ -387,13 +427,44 @@ FLASH_ALWAYS_INLINE void init_thread_worker() noexcept {
 }
 
 // ==========================================
-// 8. LOCK-FREE RECLAMATION, PARTIAL SPANS & L1 ARRAY MANAGEMENT
+// 8. LOCK-FREE RECLAMATION, PARTIAL SPANS, LARGE CACHE & L1 MANAGEMENT
 // ==========================================
+FLASH_ALWAYS_INLINE void* pop_large_extent_cache(size_t bucket_bytes) noexcept {
+    if (__builtin_expect(!G_Zone, 0)) return nullptr;
+    int lb = get_large_cache_bin(bucket_bytes);
+    if (lb < 0) return nullptr;
+
+    LockFreeLargeCache& lc = G_Zone->large_cache[lb];
+    for (size_t s = 0; s < FLASH_LARGE_CACHE_SLOTS; ++s) {
+        void* p = lc.slots[s].load(std::memory_order_relaxed);
+        if (p != nullptr && lc.slots[s].compare_exchange_strong(
+                p, nullptr, std::memory_order_acquire, std::memory_order_relaxed)) {
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+FLASH_ALWAYS_INLINE bool push_large_extent_cache(void* raw_mem, size_t bucket_bytes) noexcept {
+    if (__builtin_expect(!G_Zone || !raw_mem, 0)) return false;
+    int lb = get_large_cache_bin(bucket_bytes);
+    if (lb < 0) return false;
+
+    LockFreeLargeCache& lc = G_Zone->large_cache[lb];
+    for (size_t s = 0; s < FLASH_LARGE_CACHE_SLOTS; ++s) {
+        void* expected = nullptr;
+        if (lc.slots[s].load(std::memory_order_relaxed) == nullptr &&
+            lc.slots[s].compare_exchange_strong(
+                expected, raw_mem, std::memory_order_release, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 FLASH_ALWAYS_INLINE void release_span_reference_lockfree(CentralSpan* span) noexcept {
     uint32_t prev = span->allocated_count.fetch_sub(1U, std::memory_order_acq_rel);
 
-    // If only the partial_spans slot reference remains (all user blocks are freed),
-    // atomically pop it from partial_spans and reclaim the span.
     if (__builtin_expect(prev == 2U && span->partial_state.load(std::memory_order_acquire) == 1U, 0)) {
         WorkerEngine* owner_w = &G_Zone->workers[span->owner_worker % FLASH_MAX_WORKERS];
         LockFreePartialCache& pc = owner_w->partial_spans[span->size_class];
@@ -431,7 +502,6 @@ FLASH_ALWAYS_INLINE void try_queue_partial_span_lockfree(CentralSpan* span) noex
         return;
     }
 
-    // Hold +1 reference while span is stored in partial_spans so it can never be munmap'd
     span->allocated_count.fetch_add(1U, std::memory_order_acq_rel);
 
     WorkerEngine* owner_w = &G_Zone->workers[span->owner_worker % FLASH_MAX_WORKERS];
@@ -446,12 +516,10 @@ FLASH_ALWAYS_INLINE void try_queue_partial_span_lockfree(CentralSpan* span) noex
         }
     }
 
-    // All partial slots are currently occupied: revert state and release the temporary +1 ref
     span->partial_state.store(0U, std::memory_order_release);
     release_span_reference_lockfree(span);
 }
 
-// Pushes a block back onto span->free_list_tagged WITHOUT modifying span->allocated_count
 FLASH_ALWAYS_INLINE void repush_unharvested_block_lockfree(CentralSpan* span, uintptr_t user_addr) noexcept {
     uintptr_t span_base = reinterpret_cast<uintptr_t>(span->page_start);
     uint64_t block_offset = static_cast<uint64_t>(user_addr - span_base);
@@ -497,12 +565,11 @@ FLASH_ALWAYS_INLINE uint16_t harvest_span_freelist_lockfree(CentralSpan* span, u
                 hdr->god_tag.store(set_worker_and_alloc(old_tag, local_worker_id, false), std::memory_order_relaxed);
                 span->allocated_count.fetch_add(1, std::memory_order_relaxed);
 
-                t_cache.free_stack[bin][t_cache.count[bin]++] = curr; // L1 Array Push!
+                t_cache.free_stack[bin][t_cache.count[bin]++] = curr;
                 harvested++;
                 curr = next;
             }
 
-            // Safely re-push any leftover blocks back to span without altering allocated_count
             while (curr != 0) {
                 uint64_t* payload = reinterpret_cast<uint64_t*>(curr);
                 uintptr_t next = (*payload) ^ G_Zone->canary_seed;
@@ -538,8 +605,9 @@ FLASH_ALWAYS_INLINE void drain_l0_slab(uint8_t b) noexcept {
     uint64_t bmp = t_cache.slab_bitmap[b];
     if (bmp != ~0ULL && t_cache.slab_base[b] != 0) {
         uintptr_t slab_base = t_cache.slab_base[b];
+        uint32_t limit = t_cache.slab_count[b];
         size_t stride = sizeof(BlockHeader) + class_to_size(b);
-        for (uint32_t i = 0; i < 64; ++i) {
+        for (uint32_t i = 0; i < limit; ++i) {
             if ((bmp & (1ULL << i)) == 0) {
                 uintptr_t user_addr = slab_base + (i * stride);
                 BlockHeader* hdr = reinterpret_cast<BlockHeader*>(user_addr) - 1;
@@ -548,6 +616,7 @@ FLASH_ALWAYS_INLINE void drain_l0_slab(uint8_t b) noexcept {
         }
         t_cache.slab_bitmap[b] = ~0ULL;
         t_cache.slab_base[b]   = 0;
+        t_cache.slab_count[b]  = 0;
     }
 }
 
@@ -555,7 +624,6 @@ FLASH_ALWAYS_INLINE void drain_tcache_bin(uint8_t bin, uint16_t count_to_drain) 
     if (count_to_drain == 0 || t_cache.count[bin] < count_to_drain) return;
 
     uintptr_t batch_head = 0;
-    // Stack Array to Lock-Free XOR-Canary Linked List
     for (uint16_t i = 0; i < count_to_drain; ++i) {
         uintptr_t curr = t_cache.free_stack[bin][t_cache.count[bin] - 1 - i];
         uint64_t* payload = reinterpret_cast<uint64_t*>(curr);
@@ -599,7 +667,7 @@ FLASH_ALWAYS_INLINE bool pop_transfer_cache_batch(WorkerEngine* w, uint8_t bin) 
                 god_reg_t old_tag = hdr->god_tag.load(std::memory_order_relaxed);
                 hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, false), std::memory_order_relaxed);
 
-                t_cache.free_stack[bin][t_cache.count[bin]++] = curr; // L1 Array Push
+                t_cache.free_stack[bin][t_cache.count[bin]++] = curr;
                 curr = next;
             }
             while (curr != 0) {
@@ -621,12 +689,12 @@ FLASH_ALWAYS_INLINE void flush_remote_batch() noexcept {
     uint64_t* tail_payload = reinterpret_cast<uint64_t*>(t_cache.batch_tail);
     uintptr_t old_head = target->remote_free_head.load(std::memory_order_relaxed);
 
-    do { *tail_payload = old_head ^ G_Zone->canary_seed; } 
+    do { *tail_payload = old_head ^ G_Zone->canary_seed; }
     while (!target->remote_free_head.compare_exchange_weak(
         old_head, t_cache.batch_head, std::memory_order_seq_cst, std::memory_order_relaxed));
 
-    t_cache.batch_head  = 0;
-    t_cache.batch_tail  = 0;
+    t_cache.batch_head = 0;
+    t_cache.batch_tail = 0;
     t_cache.batch_count = 0;
 
     if (__builtin_expect(target->active_users.load(std::memory_order_seq_cst) == 0, 0)) {
@@ -650,9 +718,9 @@ FLASH_ALWAYS_INLINE void drain_remote_mailbox(WorkerEngine* w) noexcept {
         god_reg_t old_tag = hdr->god_tag.load(std::memory_order_relaxed);
         uint8_t b = get_size_class_reg(old_tag);
 
-        if (t_cache.count[b] < FLASH_TCACHE_MAX) {
+        if (b < FLASH_NUM_BINS && t_cache.count[b] < FLASH_TCACHE_MAX) {
             hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, false), std::memory_order_relaxed);
-            t_cache.free_stack[b][t_cache.count[b]++] = curr; // L1 Array Push
+            t_cache.free_stack[b][t_cache.count[b]++] = curr;
         } else {
             return_block_to_span_lockfree(curr, hdr);
         }
@@ -706,7 +774,6 @@ FLASH_ALWAYS_INLINE void refill_tcache_from_spans(uint8_t bin) noexcept {
             t_cache.active_span[bin] = span;
         }
 
-        // CARVE CHUNK FOR L0 BITMAP SLAB (Skip 4096B page-boundary blocks so small allocs never hit page_aligned_registry)
         uint32_t remaining_blocks = span->total_blocks - span->bump_index;
         uint32_t to_carve         = (remaining_blocks < 64) ? remaining_blocks : 64;
 
@@ -737,7 +804,8 @@ FLASH_ALWAYS_INLINE void refill_tcache_from_spans(uint8_t bin) noexcept {
 
         if (valid_carved > 0U) {
             span->allocated_count.fetch_add(valid_carved, std::memory_order_relaxed);
-            t_cache.slab_base[bin] = reinterpret_cast<uintptr_t>(first_block) + sizeof(BlockHeader);
+            t_cache.slab_base[bin]   = reinterpret_cast<uintptr_t>(first_block) + sizeof(BlockHeader);
+            t_cache.slab_count[bin]  = static_cast<uint8_t>(to_carve);
             uint64_t valid_bits_mask = (to_carve == 64) ? ~0ULL : ((1ULL << to_carve) - 1ULL);
             t_cache.slab_bitmap[bin] = (~valid_bits_mask) | invalid_mask;
         }
@@ -754,19 +822,39 @@ FLASH_ALWAYS_INLINE void refill_tcache_from_spans(uint8_t bin) noexcept {
 }
 
 // ==========================================
-// 9. CORE ALLOCATION & FREE APIS (100% PURE SPEED)
+// 9. CORE ALLOCATION & FREE APIS (TIER 1-4 HYBRID ENGINE)
 // ==========================================
 FLASH_ALWAYS_INLINE void* eflash_aligned_alloc_core(size_t alignment, size_t size) noexcept {
     if (alignment < 16) alignment = 16;
-    if ((alignment & (alignment - 1)) != 0) alignment = 1ULL << (64 - __builtin_clzll(alignment - 1));
+    if ((alignment & (alignment - 1)) != 0) {
+        if (alignment > (std::numeric_limits<size_t>::max() >> 1)) return nullptr;
+        alignment = 1ULL << (64 - __builtin_clzll(alignment - 1));
+    }
+    if (alignment > (std::numeric_limits<size_t>::max() >> 2)) return nullptr;
     if (__builtin_expect(EFlash_State.load(std::memory_order_acquire) != 2, 0)) init_eflash_boot_sequence();
 
-    size_t actual_size   = (size == 0) ? 16 : size;
+    size_t actual_size = (size == 0) ? 16 : size;
+    if (actual_size > std::numeric_limits<size_t>::max() - alignment - sizeof(BlockHeader) - FLASH_PAGE_SIZE) {
+        return nullptr;
+    }
+
     size_t total_request = actual_size + alignment + sizeof(BlockHeader);
     size_t aligned_bytes = (total_request + FLASH_PAGE_SIZE - 1) & ~(FLASH_PAGE_SIZE - 1);
 
-    void* raw_mem = os_page_alloc(aligned_bytes);
-    if (__builtin_expect(!raw_mem, 0)) return nullptr;
+    void* raw_mem = nullptr;
+    // Tier 3: Bounded Large Extent Cache for 512KB .. 4MB (zero mmap/munmap churn)
+    if (alignment <= FLASH_PAGE_SIZE && aligned_bytes <= FLASH_LARGE_CACHE_MAX) {
+        size_t bucket_bytes = round_up_large_cache_size(aligned_bytes);
+        if (bucket_bytes >= FLASH_LARGE_CACHE_MIN && bucket_bytes <= FLASH_LARGE_CACHE_MAX) {
+            aligned_bytes = bucket_bytes;
+            raw_mem = pop_large_extent_cache(bucket_bytes);
+        }
+    }
+
+    if (!raw_mem) {
+        raw_mem = os_page_alloc(aligned_bytes);
+        if (__builtin_expect(!raw_mem, 0)) return nullptr;
+    }
 
     uintptr_t raw_base  = reinterpret_cast<uintptr_t>(raw_mem);
     uintptr_t user_addr = (raw_base + sizeof(BlockHeader) + (alignment - 1)) & ~(alignment - 1);
@@ -783,31 +871,32 @@ FLASH_ALWAYS_INLINE void* eflash_malloc_core(size_t size) noexcept {
     size_t safe_size = (__builtin_expect(size == 0, 0)) ? 16 : size;
     if (__builtin_expect(safe_size > FLASH_MAX_FAST_ALLOC, 0)) return eflash_aligned_alloc_core(16, safe_size);
     if (__builtin_expect(!t_cache.initialized, 0)) init_thread_worker();
+    if (__builtin_expect(!t_cache.worker, 0)) return nullptr;
 
     uint8_t bin = get_size_class(safe_size);
 
-    // 1. O(1) L0 CTZLL BITMAP CACHE (Zero Cache Misses, Zero Extra Branches!)
+    // 1. O(1) L0 CTZLL BITMAP CACHE (Zero Cache Misses)
     uint64_t bmp = t_cache.slab_bitmap[bin];
     if (__builtin_expect(bmp != ~0ULL, 1)) {
         uint32_t idx = __builtin_ctzll(~bmp);
         t_cache.slab_bitmap[bin] = bmp | (1ULL << idx);
-        
+
         size_t stride = sizeof(BlockHeader) + class_to_size(bin);
         uintptr_t user_addr = t_cache.slab_base[bin] + (idx * stride);
         BlockHeader* hdr = reinterpret_cast<BlockHeader*>(user_addr) - 1;
-        
+
         god_reg_t old_tag = hdr->god_tag.load(std::memory_order_relaxed);
-        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_relaxed);
+        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_release);
         return reinterpret_cast<void*>(user_addr);
     }
 
-    // 2. L1 ARRAY STACK (Zero Pointer Chasing!)
+    // 2. L1 ARRAY STACK (Zero Pointer Chasing)
     if (__builtin_expect(t_cache.count[bin] > 0, 1)) {
         t_cache.count[bin]--;
         uintptr_t target = t_cache.free_stack[bin][t_cache.count[bin]];
         BlockHeader* hdr = reinterpret_cast<BlockHeader*>(target) - 1;
         god_reg_t old_tag = hdr->god_tag.load(std::memory_order_relaxed);
-        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_relaxed);
+        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_release);
         return reinterpret_cast<void*>(target);
     }
 
@@ -819,14 +908,14 @@ FLASH_ALWAYS_INLINE void* eflash_malloc_core(size_t size) noexcept {
             uintptr_t target = t_cache.free_stack[bin][t_cache.count[bin]];
             BlockHeader* hdr = reinterpret_cast<BlockHeader*>(target) - 1;
             god_reg_t old_tag = hdr->god_tag.load(std::memory_order_relaxed);
-            hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_relaxed);
+            hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_release);
             return reinterpret_cast<void*>(target);
         }
     }
 
     // 4. Refill from Spans (Loads L0 Bitmap Slab or L1 Stack)
     refill_tcache_from_spans(bin);
-    
+
     bmp = t_cache.slab_bitmap[bin];
     if (__builtin_expect(bmp != ~0ULL, 1)) {
         uint32_t idx = __builtin_ctzll(~bmp);
@@ -835,7 +924,7 @@ FLASH_ALWAYS_INLINE void* eflash_malloc_core(size_t size) noexcept {
         uintptr_t user_addr = t_cache.slab_base[bin] + (idx * stride);
         BlockHeader* hdr = reinterpret_cast<BlockHeader*>(user_addr) - 1;
         god_reg_t old_tag = hdr->god_tag.load(std::memory_order_relaxed);
-        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_relaxed);
+        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_release);
         return reinterpret_cast<void*>(user_addr);
     }
 
@@ -844,21 +933,20 @@ FLASH_ALWAYS_INLINE void* eflash_malloc_core(size_t size) noexcept {
         uintptr_t target = t_cache.free_stack[bin][t_cache.count[bin]];
         BlockHeader* hdr = reinterpret_cast<BlockHeader*>(target) - 1;
         god_reg_t old_tag = hdr->god_tag.load(std::memory_order_relaxed);
-        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_relaxed);
+        hdr->god_tag.store(set_worker_and_alloc(old_tag, t_cache.worker_id, true), std::memory_order_release);
         return reinterpret_cast<void*>(target);
     }
 
     return nullptr;
 }
 
-// Compile-time constant stride macro: Compiler emits 1-cycle magic multiply instead of 'divq'
+// Compile-time constant stride macro bounded by exact slab_count[bin] to prevent cross-span aliasing
 #define EFLASH_FAST_L0_CHECK(STRIDE_CONST) \
     do { \
-        if (__builtin_expect(diff < (64ULL * (STRIDE_CONST)), 1)) { \
+        if (__builtin_expect(slab_base != 0 && diff < (static_cast<size_t>(t_cache.slab_count[bin]) * (STRIDE_CONST)), 1)) { \
             if (__builtin_expect((diff % (STRIDE_CONST)) == 0, 1)) { \
                 uint32_t idx = static_cast<uint32_t>(diff / (STRIDE_CONST)); \
                 t_cache.slab_bitmap[bin] &= ~(1ULL << idx); \
-                hdr->god_tag.store(set_worker_and_alloc(tag, owner, false), std::memory_order_relaxed); \
                 return; \
             } \
         } \
@@ -879,9 +967,13 @@ FLASH_ALWAYS_INLINE void eflash_free_core(void* ptr) noexcept {
         hdr->parent_span = nullptr;
         hdr->god_tag.store(0ULL, std::memory_order_release);
         size_t total_bytes = static_cast<size_t>(get_offset(tag)) << 12;
-        os_page_free(raw_mem, total_bytes);
+        if (!push_large_extent_cache(raw_mem, total_bytes)) {
+            os_page_free(raw_mem, total_bytes);
+        }
         return;
     }
+
+    if (__builtin_expect(bin >= FLASH_NUM_BINS, 0)) return;
 
     uintptr_t user_addr = reinterpret_cast<uintptr_t>(ptr);
     uint16_t  owner     = get_worker(tag);
@@ -896,27 +988,28 @@ FLASH_ALWAYS_INLINE void eflash_free_core(void* ptr) noexcept {
         // 1. ATTEMPT L0 BITMAP SLAB RETURN (Zero-Division Fast Path)
         uintptr_t slab_base = t_cache.slab_base[bin];
         size_t diff = user_addr - slab_base;
-        
+
         switch (bin) {
-            case 0:  EFLASH_FAST_L0_CHECK(32ULL);    break;
-            case 1:  EFLASH_FAST_L0_CHECK(48ULL);    break;
-            case 2:  EFLASH_FAST_L0_CHECK(80ULL);    break;
-            case 3:  EFLASH_FAST_L0_CHECK(144ULL);   break;
-            case 4:  EFLASH_FAST_L0_CHECK(272ULL);   break;
-            case 5:  EFLASH_FAST_L0_CHECK(528ULL);   break;
-            case 6:  EFLASH_FAST_L0_CHECK(1040ULL);  break;
-            case 7:  EFLASH_FAST_L0_CHECK(2064ULL);  break;
-            case 8:  EFLASH_FAST_L0_CHECK(4112ULL);  break;
-            case 9:  EFLASH_FAST_L0_CHECK(8208ULL);  break;
-            case 10: EFLASH_FAST_L0_CHECK(16400ULL); break;
-            case 11: EFLASH_FAST_L0_CHECK(32784ULL); break;
+            case 0:  EFLASH_FAST_L0_CHECK(32ULL);     break;
+            case 1:  EFLASH_FAST_L0_CHECK(48ULL);     break;
+            case 2:  EFLASH_FAST_L0_CHECK(80ULL);     break;
+            case 3:  EFLASH_FAST_L0_CHECK(144ULL);    break;
+            case 4:  EFLASH_FAST_L0_CHECK(272ULL);    break;
+            case 5:  EFLASH_FAST_L0_CHECK(528ULL);    break;
+            case 6:  EFLASH_FAST_L0_CHECK(1040ULL);   break;
+            case 7:  EFLASH_FAST_L0_CHECK(2064ULL);   break;
+            case 8:  EFLASH_FAST_L0_CHECK(4112ULL);   break;
+            case 9:  EFLASH_FAST_L0_CHECK(8208ULL);   break;
+            case 10: EFLASH_FAST_L0_CHECK(16400ULL);  break;
+            case 11: EFLASH_FAST_L0_CHECK(32784ULL);  break;
+            case 12: EFLASH_FAST_L0_CHECK(65552ULL);  break;
+            case 13: EFLASH_FAST_L0_CHECK(131088ULL); break;
+            case 14: EFLASH_FAST_L0_CHECK(262160ULL); break;
             default: break;
         }
 
-        // 2. FALLBACK TO L1 ARRAY STACK (Zero pointer chasing)
+        // 2. FALLBACK TO L1 ARRAY STACK
         t_cache.free_stack[bin][t_cache.count[bin]++] = user_addr;
-        hdr->god_tag.store(set_worker_and_alloc(tag, owner, false), std::memory_order_relaxed);
-
         if (__builtin_expect(t_cache.count[bin] >= FLASH_TCACHE_MAX, 0)) {
             drain_tcache_bin(bin, FLASH_TCACHE_BATCH);
         }
@@ -939,7 +1032,10 @@ FLASH_ALWAYS_INLINE void eflash_free_core(void* ptr) noexcept {
         t_cache.batch_count++;
     }
 
-    if (__builtin_expect(t_cache.batch_count >= FLASH_TCACHE_MAX, 0)) flush_remote_batch();
+    // Flush promptly for medium blocks (>= 16KB) or when bounded batch reaches 64
+    if (__builtin_expect(t_cache.batch_count >= FLASH_REMOTE_BATCH_MAX || bin >= 10, 0)) {
+        flush_remote_batch();
+    }
 }
 
 #undef EFLASH_FAST_L0_CHECK
@@ -957,6 +1053,7 @@ FLASH_ALWAYS_INLINE size_t eflash_usable_size(void* ptr) noexcept {
         uintptr_t user_ptr = reinterpret_cast<uintptr_t>(ptr);
         return (raw_base + total_bytes) - user_ptr;
     }
+    if (bin >= FLASH_NUM_BINS) return 0;
     return class_to_size(bin);
 }
 
